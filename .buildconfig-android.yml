@@ -137,3 +137,10 @@ projects:
     publications:
     - name: tooling-nimbus-gradle
       type: jar
+  search:
+    path: components/search/android
+    artifactId: search
+    publications:
+    - name: search
+      type: aar
+    description: search-description
