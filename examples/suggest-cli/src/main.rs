@@ -9,11 +9,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use remote_settings::RemoteSettingsServer;
 use suggest::{
-    SuggestIngestionConstraints, SuggestStore, SuggestStoreBuilder, SuggestionProvider,
-    SuggestionQuery,
+    AmpMatchingStrategy, SuggestIngestionConstraints, SuggestStore, SuggestStoreBuilder,
+    SuggestionProvider, SuggestionProviderConstraints, SuggestionQuery,
 };
 
-static DB_PATH: &str = "suggest.db";
+static DB_FILENAME: &str = "suggest.db";
 
 const DEFAULT_LOG_FILTER: &str = "suggest::store=info";
 const DEFAULT_LOG_FILTER_VERBOSE: &str = "suggest::store=trace";
@@ -56,7 +56,29 @@ enum Commands {
         provider: Option<SuggestionProviderArg>,
         /// Input to search
         input: String,
+        #[clap(long, short)]
+        amp_matching_strategy: Option<AmpMatchingStrategyArg>,
     },
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum AmpMatchingStrategyArg {
+    /// Use keyword matching, without keyword expansion
+    NoKeyword,
+    /// Use FTS matching
+    Fts,
+    /// Use FTS matching against the title
+    FtsTitle,
+}
+
+impl From<AmpMatchingStrategyArg> for AmpMatchingStrategy {
+    fn from(val: AmpMatchingStrategyArg) -> Self {
+        match val {
+            AmpMatchingStrategyArg::NoKeyword => AmpMatchingStrategy::NoKeywordExpansion,
+            AmpMatchingStrategyArg::Fts => AmpMatchingStrategy::FtsAgainstFullKeywords,
+            AmpMatchingStrategyArg::FtsTitle => AmpMatchingStrategy::FtsAgainstTitle,
+        }
+    }
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -109,14 +131,22 @@ fn main() -> Result<()> {
             provider,
             input,
             fts_match_info,
-        } => query(&store, provider, input, fts_match_info, cli.verbose),
+            amp_matching_strategy,
+        } => query(
+            &store,
+            provider,
+            input,
+            fts_match_info,
+            amp_matching_strategy,
+            cli.verbose,
+        ),
     };
     Ok(())
 }
 
 fn build_store(cli: &Cli) -> Arc<SuggestStore> {
     Arc::new(SuggestStoreBuilder::default())
-        .data_path(DB_PATH.to_string())
+        .data_path(cli_support::cli_data_path(DB_FILENAME))
         .remote_settings_server(match cli.remote_settings_server {
             None => RemoteSettingsServer::Prod,
             Some(RemoteSettingsServerArg::Dev) => RemoteSettingsServer::Dev,
@@ -185,6 +215,7 @@ fn query(
     provider: Option<SuggestionProviderArg>,
     input: String,
     fts_match_info: bool,
+    amp_matching_strategy: Option<AmpMatchingStrategyArg>,
     verbose: bool,
 ) {
     let query = SuggestionQuery {
@@ -193,6 +224,10 @@ fn query(
             None => SuggestionProvider::all().to_vec(),
         },
         keyword: input,
+        provider_constraints: Some(SuggestionProviderConstraints {
+            amp_alternative_matching: amp_matching_strategy.map(Into::into),
+            ..SuggestionProviderConstraints::default()
+        }),
         ..SuggestionQuery::default()
     };
     let mut results = store

@@ -12,7 +12,7 @@ use std::{
 use error_support::{breadcrumb, handle_error};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
-use remote_settings::{self, RemoteSettingsConfig, RemoteSettingsServer};
+use remote_settings::{self, RemoteSettingsConfig, RemoteSettingsServer, RemoteSettingsService};
 
 use serde::de::DeserializeOwned;
 
@@ -77,6 +77,15 @@ impl SuggestStoreBuilder {
 
     pub fn remote_settings_bucket_name(self: Arc<Self>, bucket_name: String) -> Arc<Self> {
         self.0.lock().remote_settings_bucket_name = Some(bucket_name);
+        self
+    }
+
+    pub fn remote_settings_service(
+        self: Arc<Self>,
+        _rs_service: Arc<RemoteSettingsService>,
+    ) -> Arc<Self> {
+        // When #6607 lands, this will set the remote settings service.
+        // For now, it just exists so we can move consumers over to the new API ahead of time.
         self
     }
 
@@ -361,6 +370,14 @@ impl SuggestIngestionConstraints {
                 .any(|t| *t == record.suggestion_type),
         }
     }
+
+    fn amp_matching_uses_fts(&self) -> bool {
+        self.provider_constraints
+            .as_ref()
+            .and_then(|c| c.amp_alternative_matching.as_ref())
+            .map(|constraints| constraints.uses_fts())
+            .unwrap_or(false)
+    }
 }
 
 /// The implementation of the store. This is generic over the Remote Settings
@@ -613,6 +630,8 @@ where
             if self.should_reprocess_record(dao, record, constraints)? {
                 log::trace!("Reingesting unchanged record ID: {}", record.id.as_str());
                 self.process_record(dao, record, constraints, context)?;
+            } else {
+                log::trace!("Skipping unchanged record ID: {}", record.id.as_str());
             }
         }
         for record in &changes.deleted {
@@ -638,7 +657,11 @@ where
         match &record.payload {
             SuggestRecord::AmpWikipedia => {
                 self.download_attachment(dao, record, context, |dao, record_id, suggestions| {
-                    dao.insert_amp_wikipedia_suggestions(record_id, suggestions)
+                    dao.insert_amp_wikipedia_suggestions(
+                        record_id,
+                        suggestions,
+                        constraints.amp_matching_uses_fts(),
+                    )
                 })?;
             }
             SuggestRecord::AmpMobile => {
@@ -752,6 +775,10 @@ where
                 // the current ingest do match the suggestion.
                 Ok(!dao.is_exposure_suggestion_ingested(&record.id)?
                     && constraints.matches_exposure_record(r))
+            }
+            SuggestRecord::AmpWikipedia => {
+                Ok(constraints.amp_matching_uses_fts()
+                    && !dao.is_amp_fts_data_ingested(&record.id)?)
             }
             _ => Ok(false),
         }
@@ -912,7 +939,29 @@ pub(crate) mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::{suggestion::FtsMatchInfo, testing::*, SuggestionProvider};
+    use crate::{
+        provider::AmpMatchingStrategy, suggestion::FtsMatchInfo, testing::*, SuggestionProvider,
+    };
+
+    // Extra methods for the tests
+    impl SuggestIngestionConstraints {
+        fn amp_with_fts() -> Self {
+            Self {
+                providers: Some(vec![SuggestionProvider::Amp]),
+                provider_constraints: Some(SuggestionProviderConstraints {
+                    amp_alternative_matching: Some(AmpMatchingStrategy::FtsAgainstFullKeywords),
+                    ..SuggestionProviderConstraints::default()
+                }),
+                ..Self::default()
+            }
+        }
+        fn amp_without_fts() -> Self {
+            Self {
+                providers: Some(vec![SuggestionProvider::Amp]),
+                ..Self::default()
+            }
+        }
+    }
 
     /// In-memory Suggest store for testing
     pub(crate) struct TestStore {
@@ -1004,7 +1053,7 @@ pub(crate) mod tests {
         store.ingest(SuggestIngestionConstraints::all_providers());
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::amp("lo")),
-            vec![los_pollos_suggestion("los")],
+            vec![los_pollos_suggestion("los", None)],
         );
         Ok(())
     }
@@ -1066,11 +1115,11 @@ pub(crate) mod tests {
 
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::amp("lo")),
-            vec![los_pollos_suggestion("los")]
+            vec![los_pollos_suggestion("los", None)]
         );
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::amp("la")),
-            vec![good_place_eats_suggestion("lasagna")]
+            vec![good_place_eats_suggestion("lasagna", None)]
         );
 
         Ok(())
@@ -1121,14 +1170,14 @@ pub(crate) mod tests {
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::amp("lo")),
             // This keyword comes from the provided full_keywords list
-            vec![los_pollos_suggestion("los pollos")],
+            vec![los_pollos_suggestion("los pollos", None)],
         );
 
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::amp("la")),
             // Good place eats did not have full keywords, so this one is calculated with the
             // keywords.rs code
-            vec![good_place_eats_suggestion("lasagna")],
+            vec![good_place_eats_suggestion("lasagna", None)],
         );
 
         assert_eq!(
@@ -1141,9 +1190,129 @@ pub(crate) mod tests {
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::amp_mobile("a1a")),
             // This keyword comes from the provided full_keywords list.
-            vec![a1a_suggestion("A1A Car Wash")],
+            vec![a1a_suggestion("A1A Car Wash", None)],
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn amp_no_keyword_expansion() -> anyhow::Result<()> {
+        before_each();
+
+        let store = TestStore::new(
+            MockRemoteSettingsClient::default()
+                // Setup the keywords such that:
+                //   * There's a `chicken` keyword, which is not a substring of any full
+                //     keywords (i.e. it was the result of keyword expansion).
+                //   * There's a `los pollos ` keyword with an extra space
+                .with_record(
+                    "data",
+                    "1234",
+                    los_pollos_amp().merge(json!({
+                        "keywords": ["los", "los pollos", "los pollos ", "los pollos hermanos", "chicken"],
+                        "full_keywords": [("los pollos", 3), ("los pollos hermanos", 2)],
+                    }))
+                )
+                .with_icon(los_pollos_icon()),
+        );
+        store.ingest(SuggestIngestionConstraints::all_providers());
+        assert_eq!(
+            store.fetch_suggestions(SuggestionQuery {
+                provider_constraints: Some(SuggestionProviderConstraints {
+                    amp_alternative_matching: Some(AmpMatchingStrategy::NoKeywordExpansion),
+                    ..SuggestionProviderConstraints::default()
+                }),
+                // Should not match, because `chicken` is not a substring of a full keyword.
+                // i.e. it was added because of keyword expansion.
+                ..SuggestionQuery::amp("chicken")
+            }),
+            vec![],
+        );
+        assert_eq!(
+            store.fetch_suggestions(SuggestionQuery {
+                provider_constraints: Some(SuggestionProviderConstraints {
+                    amp_alternative_matching: Some(AmpMatchingStrategy::NoKeywordExpansion),
+                    ..SuggestionProviderConstraints::default()
+                }),
+                // Should match, even though "los pollos " technically is not a substring
+                // because there's an extra space.  The reason these keywords are in the DB is
+                // because we want to keep showing the current suggestion when the user types
+                // the space key.
+                ..SuggestionQuery::amp("los pollos ")
+            }),
+            vec![los_pollos_suggestion("los pollos", None)],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn amp_fts_against_full_keywords() -> anyhow::Result<()> {
+        before_each();
+
+        let store = TestStore::new(
+            MockRemoteSettingsClient::default()
+                // Make sure there's full keywords to match against
+                .with_record(
+                    "data",
+                    "1234",
+                    los_pollos_amp().merge(json!({
+                        "keywords": ["los", "los pollos", "los pollos ", "los pollos hermanos"],
+                        "full_keywords": [("los pollos", 3), ("los pollos hermanos", 1)],
+                    })),
+                )
+                .with_icon(los_pollos_icon()),
+        );
+        store.ingest(SuggestIngestionConstraints::amp_with_fts());
+        assert_eq!(
+            store.fetch_suggestions(SuggestionQuery {
+                provider_constraints: Some(SuggestionProviderConstraints {
+                    amp_alternative_matching: Some(AmpMatchingStrategy::FtsAgainstFullKeywords),
+                    ..SuggestionProviderConstraints::default()
+                }),
+                // "Hermanos" should match, even though it's not listed in the keywords,
+                // because this strategy uses an FTS match against the full keyword list.
+                ..SuggestionQuery::amp("hermanos")
+            }),
+            vec![los_pollos_suggestion(
+                "hermanos",
+                Some(FtsMatchInfo {
+                    prefix: false,
+                    stemming: false,
+                })
+            )],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn amp_fts_against_title() -> anyhow::Result<()> {
+        before_each();
+
+        let store = TestStore::new(
+            MockRemoteSettingsClient::default()
+                .with_record("data", "1234", los_pollos_amp())
+                .with_icon(los_pollos_icon()),
+        );
+        store.ingest(SuggestIngestionConstraints::amp_with_fts());
+        assert_eq!(
+            store.fetch_suggestions(SuggestionQuery {
+                provider_constraints: Some(SuggestionProviderConstraints {
+                    amp_alternative_matching: Some(AmpMatchingStrategy::FtsAgainstTitle),
+                    ..SuggestionProviderConstraints::default()
+                }),
+                // "Albuquerque" should match, even though it's not listed in the keywords,
+                // because this strategy uses an FTS match against the title
+                ..SuggestionQuery::amp("albuquerque")
+            }),
+            vec![los_pollos_suggestion(
+                "albuquerque",
+                Some(FtsMatchInfo {
+                    prefix: false,
+                    stemming: false,
+                })
+            )],
+        );
         Ok(())
     }
 
@@ -1162,7 +1331,7 @@ pub(crate) mod tests {
         store.ingest(SuggestIngestionConstraints::all_providers());
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::amp("lo")),
-            vec![los_pollos_suggestion("los")],
+            vec![los_pollos_suggestion("los", None)],
         );
 
         Ok(())
@@ -1209,6 +1378,49 @@ pub(crate) mod tests {
             [ Suggestion::Amp { title, url, .. } ] if title == "Penne for Your Thoughts" && url == "https://penne.biz"
         ));
 
+        Ok(())
+    }
+
+    #[test]
+    fn reingest_amp_after_fts_constraint_changes() -> anyhow::Result<()> {
+        before_each();
+
+        // Ingest with FTS enabled, this will populate the FTS table
+        let store = TestStore::new(
+            MockRemoteSettingsClient::default()
+                .with_record(
+                    "data",
+                    "data-1",
+                    json!([los_pollos_amp().merge(json!({
+                        "keywords": ["los", "los pollos", "los pollos ", "los pollos hermanos"],
+                        "full_keywords": [("los pollos", 3), ("los pollos hermanos", 1)],
+                    }))]),
+                )
+                .with_icon(los_pollos_icon()),
+        );
+        // Ingest without FTS
+        store.ingest(SuggestIngestionConstraints::amp_without_fts());
+        // Ingest again with FTS
+        store.ingest(SuggestIngestionConstraints::amp_with_fts());
+
+        assert_eq!(
+            store.fetch_suggestions(SuggestionQuery {
+                provider_constraints: Some(SuggestionProviderConstraints {
+                    amp_alternative_matching: Some(AmpMatchingStrategy::FtsAgainstFullKeywords),
+                    ..SuggestionProviderConstraints::default()
+                }),
+                // "Hermanos" should match, even though it's not listed in the keywords,
+                // because this strategy uses an FTS match against the full keyword list.
+                ..SuggestionQuery::amp("hermanos")
+            }),
+            vec![los_pollos_suggestion(
+                "hermanos",
+                Some(FtsMatchInfo {
+                    prefix: false,
+                    stemming: false,
+                }),
+            )],
+        );
         Ok(())
     }
 
@@ -1348,11 +1560,11 @@ pub(crate) mod tests {
         store.ingest(SuggestIngestionConstraints::all_providers());
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::amp("lo")),
-            vec![los_pollos_suggestion("los")],
+            vec![los_pollos_suggestion("los", None)],
         );
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::amp("la")),
-            vec![good_place_eats_suggestion("lasagna")],
+            vec![good_place_eats_suggestion("lasagna", None)],
         );
         // Re-ingest without los-pollos and good place eat's icon.  The suggest store should
         // recognize that they're missing and delete them.
@@ -1441,7 +1653,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::all_providers("la")),
-            vec![good_place_eats_suggestion("lasagna"),]
+            vec![good_place_eats_suggestion("lasagna", None),]
         );
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::all_providers("multimatch")),
@@ -1468,7 +1680,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::amp("la")),
-            vec![good_place_eats_suggestion("lasagna")],
+            vec![good_place_eats_suggestion("lasagna", None)],
         );
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::all_providers_except(
@@ -1861,16 +2073,16 @@ pub(crate) mod tests {
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::all_providers("amp wiki match")),
             vec![
-                los_pollos_suggestion("amp wiki match").with_score(0.3),
+                los_pollos_suggestion("amp wiki match", None).with_score(0.3),
                 // Wikipedia entries default to a 0.2 score
                 california_suggestion("amp wiki match"),
-                good_place_eats_suggestion("amp wiki match").with_score(0.1),
+                good_place_eats_suggestion("amp wiki match", None).with_score(0.1),
             ]
         );
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::all_providers("amp wiki match").limit(2)),
             vec![
-                los_pollos_suggestion("amp wiki match").with_score(0.3),
+                los_pollos_suggestion("amp wiki match", None).with_score(0.3),
                 california_suggestion("amp wiki match"),
             ]
         );
@@ -1920,11 +2132,11 @@ pub(crate) mod tests {
         // The query results should be exactly the same for both the Amp and AmpMobile data
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::amp_mobile("las")),
-            vec![good_place_eats_suggestion("lasagna")]
+            vec![good_place_eats_suggestion("lasagna", None)]
         );
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::amp("las")),
-            vec![good_place_eats_suggestion("lasagna")]
+            vec![good_place_eats_suggestion("lasagna", None)]
         );
         Ok(())
     }
@@ -1983,7 +2195,7 @@ pub(crate) mod tests {
         // This should have been ingested
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::amp("lo")),
-            vec![los_pollos_suggestion("los")]
+            vec![los_pollos_suggestion("los", None)]
         );
         // This should not have been ingested, since it wasn't in the providers list
         assert_eq!(
@@ -2027,7 +2239,7 @@ pub(crate) mod tests {
         // Test that the valid record was read
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::amp("la")),
-            vec![good_place_eats_suggestion("lasagna")]
+            vec![good_place_eats_suggestion("lasagna", None)]
         );
         // Test that the invalid record was skipped
         assert_eq!(store.fetch_suggestions(SuggestionQuery::amp("lo")), vec![]);
@@ -2456,7 +2668,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             store.fetch_suggestions(SuggestionQuery::amp("lo")),
-            vec![los_pollos_suggestion("los")],
+            vec![los_pollos_suggestion("los", None)],
         );
         // Test deleting one of the records
         store
@@ -2538,6 +2750,7 @@ pub(crate) mod tests {
             providers: Some(vec![SuggestionProvider::Exposure]),
             provider_constraints: Some(SuggestionProviderConstraints {
                 exposure_suggestion_types: Some(vec!["aaa".to_string(), "bbb".to_string()]),
+                ..SuggestionProviderConstraints::default()
             }),
             ..SuggestIngestionConstraints::all_providers()
         });
@@ -2810,6 +3023,7 @@ pub(crate) mod tests {
             providers: Some(vec![SuggestionProvider::Exposure]),
             provider_constraints: Some(SuggestionProviderConstraints {
                 exposure_suggestion_types: Some(vec!["aaa".to_string()]),
+                ..SuggestionProviderConstraints::default()
             }),
             ..SuggestIngestionConstraints::all_providers()
         });
@@ -2847,6 +3061,7 @@ pub(crate) mod tests {
             providers: Some(vec![SuggestionProvider::Exposure]),
             provider_constraints: Some(SuggestionProviderConstraints {
                 exposure_suggestion_types: Some(vec!["aaa".to_string()]),
+                ..SuggestionProviderConstraints::default()
             }),
             ..SuggestIngestionConstraints::all_providers()
         });
@@ -2946,6 +3161,7 @@ pub(crate) mod tests {
             providers: Some(vec![SuggestionProvider::Exposure]),
             provider_constraints: Some(SuggestionProviderConstraints {
                 exposure_suggestion_types: Some(vec!["bbb".to_string()]),
+                ..SuggestionProviderConstraints::default()
             }),
             ..SuggestIngestionConstraints::all_providers()
         });
@@ -2979,6 +3195,7 @@ pub(crate) mod tests {
             providers: Some(vec![SuggestionProvider::Exposure]),
             provider_constraints: Some(SuggestionProviderConstraints {
                 exposure_suggestion_types: Some(vec!["aaa".to_string()]),
+                ..SuggestionProviderConstraints::default()
             }),
             ..SuggestIngestionConstraints::all_providers()
         });
@@ -3029,6 +3246,7 @@ pub(crate) mod tests {
             providers: Some(vec![SuggestionProvider::Exposure]),
             provider_constraints: Some(SuggestionProviderConstraints {
                 exposure_suggestion_types: Some(vec!["aaa".to_string()]),
+                ..SuggestionProviderConstraints::default()
             }),
             ..SuggestIngestionConstraints::all_providers()
         });
@@ -3063,6 +3281,7 @@ pub(crate) mod tests {
             providers: Some(vec![SuggestionProvider::Exposure]),
             provider_constraints: Some(SuggestionProviderConstraints {
                 exposure_suggestion_types: Some(vec!["aaa".to_string()]),
+                ..SuggestionProviderConstraints::default()
             }),
             ..SuggestIngestionConstraints::all_providers()
         });

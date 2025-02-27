@@ -2,8 +2,6 @@
 
 buildscript {
     ext.build = [
-        ndkVersion: "27.2.12479018", // Keep it in sync in TC Dockerfile.
-
         // In general, we should aim to keep these in sync with AC
         compileSdkVersion: 35,
         targetSdkVersion: 35,
@@ -201,8 +199,9 @@ ext.libsRootDir = useDownloadedLibs ? rootProject.buildDir : rootProject.rootDir
 
 subprojects {
     group = "org.mozilla.appservices"
-    apply plugin: 'maven-publish'
-
+    if (!gradle.hasProperty("mozconfig")) {
+        apply plugin: 'maven-publish'
+    }
     // Kotlin settings applicable to all modules.
     afterEvaluate{
         if (it.hasProperty('android')) {
@@ -310,6 +309,6 @@ task autoPublishForLocalDevelopment(type: Exec) {
 
 task printNdkVersion {
     doLast {
-        println project.ext.build.ndkVersion
+        println config.ndkVersion
     }
 }

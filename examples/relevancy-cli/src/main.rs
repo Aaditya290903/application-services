@@ -15,7 +15,7 @@ use sync15::engine::SyncEngineId;
 
 use anyhow::{bail, Result};
 
-static CREDENTIALS_PATH: &str = "credentials.json";
+static CREDENTIALS_PATH: &str = ".cli-data/credentials.json";
 
 #[derive(Parser)]
 #[command(about, long_about = None)]
@@ -34,6 +34,9 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     viaduct_reqwest::use_reqwest_backend();
+    if let Some(dir) = std::path::PathBuf::from(CREDENTIALS_PATH).parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let mut builder = Builder::new();
     builder.filter_level(log::LevelFilter::Info);
     if cli.verbose {
@@ -41,8 +44,10 @@ fn main() -> Result<()> {
     }
     builder.init();
     println!("================== Initializing Relevancy ===================");
-    let relevancy_store =
-        RelevancyStore::new("file:relevancy-cli-relevancy?mode=memory&cache=shared".to_owned());
+    let relevancy_store = RelevancyStore::new(
+        "file:relevancy-cli-relevancy?mode=memory&cache=shared".to_owned(),
+        None,
+    );
     relevancy_store.ensure_interest_data_populated()?;
 
     println!("==================== Downloading History ====================");
